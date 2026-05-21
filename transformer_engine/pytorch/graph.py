@@ -551,6 +551,13 @@ def _make_graphed_callables(
                         "(grad_input must not be modified via hook return)"
                     )
 
+    def _run_post_wgrad_param_hooks(module):
+        """Run parameter hooks registered for delayed wgrad completion."""
+        for param in module.parameters():
+            hook = getattr(param, "post_wgrad_grad_acc_hook", None)
+            if hook is not None:
+                hook()
+
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx):
         """Run dgrad backward for one callable during warmup."""
         static_input_surface = per_callable_static_input_surfaces[func_idx]
@@ -617,6 +624,7 @@ def _make_graphed_callables(
             if hasattr(module, "need_backward_dw") and module.need_backward_dw():
                 need_backward_dw = True
                 module.backward_dw()
+                _run_post_wgrad_param_hooks(module)
         need_bwd_dw_graph[func_idx] = need_backward_dw
         _run_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs)
 
@@ -819,6 +827,7 @@ def _make_graphed_callables(
                                     and module.need_backward_dw()
                                 ):
                                     module.backward_dw()
+                                    _run_post_wgrad_param_hooks(module)
                         callable_module = graph_callables[per_callable_bwd_idx]
                         static_grad_outputs = per_callable_static_grad_outputs[
                             per_callable_bwd_idx
@@ -1044,6 +1053,7 @@ def _make_graphed_callables(
                         for module in visited_te_modules[bwd_idx]:
                             if hasattr(module, "need_backward_dw") and module.need_backward_dw():
                                 module.backward_dw()
+                                _run_post_wgrad_param_hooks(module)
                 callable_module = graph_callables[bwd_idx]
                 _run_capture_time_backward_hooks(
                     bwd_idx, callable_module, grad_inputs, static_grad_outputs
@@ -1235,6 +1245,7 @@ def _make_graphed_callables(
                         and module.need_backward_dw()
                     ):
                         module._trigger_wgrad_accumulation_and_reduce_hooks()
+                    _run_post_wgrad_param_hooks(module)
 
         # Attach reset as an attribute to the graphed callable.
         def reset():
