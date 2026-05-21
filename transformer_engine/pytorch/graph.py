@@ -537,6 +537,20 @@ def _make_graphed_callables(
         outputs, _ = _tree_flatten(outputs)
         return outputs
 
+    def _run_capture_time_backward_hooks(callable_idx, callable_module, grad_inputs, grad_outputs):
+        """Run hooks that must fire after both dgrad and delayed wgrad."""
+        if (
+            capture_time_hooks is not None
+            and capture_time_hooks[callable_idx] is not None
+            and "backward_hooks" in capture_time_hooks[callable_idx]
+        ):
+            for hook in capture_time_hooks[callable_idx]["backward_hooks"].values():
+                if hook(callable_module, grad_inputs, grad_outputs) is not None:
+                    raise RuntimeError(
+                        "capture_time_hooks backward_hooks must not return a value "
+                        "(grad_input must not be modified via hook return)"
+                    )
+
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx):
         """Run dgrad backward for one callable during warmup."""
         static_input_surface = per_callable_static_input_surfaces[func_idx]
@@ -560,18 +574,6 @@ def _make_graphed_callables(
         with _none_grad_context_wrapper(inputs):
             torch.autograd.backward(outputs_requiring_grad, grad_tensors=grad_outputs)
             grad_inputs = tuple(input.grad for input in inputs)
-
-        if (
-            capture_time_hooks is not None
-            and capture_time_hooks[callable_idx] is not None
-            and "backward_hooks" in capture_time_hooks[callable_idx]
-        ):
-            for hook in capture_time_hooks[callable_idx]["backward_hooks"].values():
-                if hook(func, grad_inputs, grad_outputs) is not None:
-                    raise RuntimeError(
-                        "capture_time_hooks backward_hooks must not return a value "
-                        "(grad_input must not be modified via hook return)"
-                    )
 
         # Filter module params that get None grad from grad_inputs and remove them
         # from static_input_surface. This is to ensure that the backward hooks
@@ -616,6 +618,7 @@ def _make_graphed_callables(
                 need_backward_dw = True
                 module.backward_dw()
         need_bwd_dw_graph[func_idx] = need_backward_dw
+        _run_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs)
 
     # Run warmup and do the above filtering.
     with torch.cuda.stream(torch.cuda.Stream()):
@@ -816,6 +819,18 @@ def _make_graphed_callables(
                                     and module.need_backward_dw()
                                 ):
                                     module.backward_dw()
+                        callable_module = graph_callables[per_callable_bwd_idx]
+                        static_grad_outputs = per_callable_static_grad_outputs[
+                            per_callable_bwd_idx
+                        ]
+                        grad_inputs = tuple(
+                            grad
+                            for grad in per_callable_static_grad_inputs[per_callable_bwd_idx]
+                            if grad is not None
+                        )
+                        _run_capture_time_backward_hooks(
+                            callable_idx, callable_module, grad_inputs, static_grad_outputs
+                        )
                         continue
 
                     static_input_surface = per_callable_static_input_surfaces[per_callable_bwd_idx]
@@ -874,23 +889,13 @@ def _make_graphed_callables(
                             )
                             grad_inputs = tuple(input.grad for input in inputs)
 
-                        # Call backward hooks after backward graph capture (outside capture context)
-                        if (
-                            capture_time_hooks is not None
-                            and capture_time_hooks[callable_idx] is not None
-                            and "backward_hooks" in capture_time_hooks[callable_idx]
-                        ):
-                            # Get the callable module for this backward index
+                        # Call backward hooks after delayed wgrad has run. If this callable has
+                        # no delayed wgrad graph, this dgrad capture is the last backward phase.
+                        if not need_bwd_dw_graph[per_callable_bwd_idx]:
                             callable_module = graph_callables[per_callable_bwd_idx]
-                            for hook in capture_time_hooks[callable_idx]["backward_hooks"].values():
-                                if (
-                                    hook(callable_module, grad_inputs, static_grad_outputs)
-                                    is not None
-                                ):
-                                    raise RuntimeError(
-                                        "capture_time_hooks backward_hooks must not return a value "
-                                        "(grad_input must not be modified via hook return)"
-                                    )
+                            _run_capture_time_backward_hooks(
+                                callable_idx, callable_module, grad_inputs, static_grad_outputs
+                            )
 
                     # Constructs a tuple suitable for returning from Graphed.backward:
                     # Pads out the actually-needed grads with Nones in gradient slots for inputs
@@ -1034,25 +1039,15 @@ def _make_graphed_callables(
                     )
                     grad_inputs = tuple(input.grad for input in inputs)
 
-                # Call backward hooks after backward graph capture (outside capture context)
-                if (
-                    capture_time_hooks is not None
-                    and capture_time_hooks[bwd_idx] is not None
-                    and "backward_hooks" in capture_time_hooks[bwd_idx]
-                ):
-                    callable_module = graph_callables[bwd_idx]
-                    for hook in capture_time_hooks[bwd_idx]["backward_hooks"].values():
-                        if hook(callable_module, grad_inputs, static_grad_outputs) is not None:
-                            raise RuntimeError(
-                                "capture_time_hooks backward_hooks must not return a value "
-                                "(grad_input must not be modified via hook return)"
-                            )
-
                 if need_bwd_dw_graph[bwd_idx]:
                     with _graph_context_wrapper(bwd_dw_graph, pool=mempool):
                         for module in visited_te_modules[bwd_idx]:
                             if hasattr(module, "need_backward_dw") and module.need_backward_dw():
                                 module.backward_dw()
+                callable_module = graph_callables[bwd_idx]
+                _run_capture_time_backward_hooks(
+                    bwd_idx, callable_module, grad_inputs, static_grad_outputs
+                )
             # Constructs a tuple suitable for returning from Graphed.backward:
             # Pads out the actually-needed grads with Nones in gradient slots for inputs that
             # don't require grad. I couldn't think of a slick one-liner for this pattern.
